@@ -1,0 +1,3 @@
+[submodule "i2cbus"]
+	path = i2cbus
+	url = git@github.com:SPACE-HAUC/i2cbus.git
