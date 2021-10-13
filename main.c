@@ -4,63 +4,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <signal.h>
-#include <fcntl.h>
-#include <linux/i2c.h>
-#include <linux/i2c-dev.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
- 
-// Opens the specified I2C device.  Returns a non-negative file descriptor
-// on success, or -1 on failure.
-int open_i2c_device(const char * device)
-{
-  int fd = open(device, O_RDWR);
-  if (fd == -1)
-  {
-    perror(device);
-    return -1;
-  }
-  return fd;
-}
- 
-// Sets the target, returning 0 on success and -1 on failure.
-//
-// For more information about what this command does, see the "Set Target"
-// command in the "Command reference" section of the Jrk G2 user's guide.
-int write_byte(int fd, uint8_t address, uint8_t reg, uint8_t cmd)
-{
-  uint8_t command[] = {reg, cmd};
-  struct i2c_msg message = { address, 0, sizeof(command), command };
-  struct i2c_rdwr_ioctl_data ioctl_data = { &message, 1 };
-  int result = ioctl(fd, I2C_RDWR, &ioctl_data);
-  if (result != 1)
-  {
-    perror("failed to set target");
-    return -1;
-  }
-  return 1;
-}
- 
-// Gets one or more variables from the Jrk (without clearing them).
-// Returns 0 for success, -1 for failure.
-int read_byte(int fd, uint8_t address, uint8_t reg, uint8_t *val)
-{
-  uint8_t command[] = { reg };
-  struct i2c_msg messages[] = {
-    { address, 0, sizeof(command), command },
-    { address, I2C_M_RD, sizeof(uint8_t), val },
-  };
-  struct i2c_rdwr_ioctl_data ioctl_data = { messages, 2 };
-  int result = ioctl(fd, I2C_RDWR, &ioctl_data);
-  if (result != 2)
-  {
-    perror("failed to get variables");
-    return -1;
-  }
-  return 1;
-}
+#include "i2cbus/i2cbus.h"
 
 volatile sig_atomic_t done = 0;
 void sighandler(int sig)
@@ -76,30 +20,81 @@ int main(int argc, char *argv[])
         exit(0);
     }
     int bus = atoi(argv[1]);
-    int addr = argc == 3 ? atoi(argv[2]) : 0x45;
+    int addr = argc == 3 ? strtol(argv[2], NULL, 16) : 0x45;
     printf("Opening bus: %d, device: 0x%x\n", bus, addr);
-    char devname[128];
-    snprintf(devname, sizeof(devname), "/dev/i2c-%d", bus);
-    int dev = open_i2c_device(devname);
-    if (dev < 0)
+    i2cbus dev[1];
+    if (i2cbus_open(dev, bus, addr) < 0)
     {
         printf("Error opening device/bus, exiting.\n");
         exit(0);
     }
-    printf("Resetting chip %d...\n", dev);
+    signal(SIGINT, sighandler);
+    sleep(2);
+// Step 1: Reset chip
+    printf("Resetting chip... ");
     fflush(stdout);
-    uint8_t reg = 0x4;
-    uint8_t cmd = 0b00100000;
-    while((write_byte(dev, addr, reg, cmd) < 0) && (!done))
+    uint8_t cmd[2];
+    cmd[0] = 0x4; // control register
+    cmd[1] = 0b00100000; // reset command
+    while((i2cbus_write(dev, &cmd, sizeof(cmd)) < 0) && (!done))
         sleep(1);
     if (done)
-        exit(0);
-    sleep(1);
-    while((read_byte(dev, addr, reg, &cmd) < 0) && (!done))
+        goto cleanup;
+    printf("Done\n");
+    fflush(stdout);
+// Step 2: Enable register input
+    printf("Enabling register control... ");
+    fflush(stdout);
+    cmd[0] = 0x4; // control reg
+    cmd[1] = 0x7; // update all voltages from register
+    while((i2cbus_write(dev, &cmd, sizeof(cmd)) < 0) && (!done))
         sleep(1);
-    printf("Done: 0x%x\n", cmd);
     if (done)
-        exit(0);
-    
+        goto cleanup;
+    printf("Done\n");
+    fflush(stdout);
+// Step 3: Set VNEG to -8V
+    printf("Setting VNEG to -8.0 V... ");
+    fflush(stdout);
+    cmd[0] = 0x1; // vneg reg
+    cmd[1] = 0x88; // set voltage
+    while((i2cbus_write(dev, &cmd, sizeof(cmd)) < 0) && (!done))
+        sleep(1);
+    if (done)
+        goto cleanup;
+    printf("Done\n");
+    fflush(stdout);
+// Step 4: Enable output
+    printf("Enabling output... ");
+    fflush(stdout);
+    cmd[0] = 0x2; // output reg
+    cmd[1] = 0x3; // enable all outputs
+    while((i2cbus_write(dev, &cmd, sizeof(cmd)) < 0) && (!done))
+        sleep(1);
+    if (done)
+        goto cleanup;
+    printf("Done\n");
+    fflush(stdout);
+// Step 5: Parse inputs
+    while (!done)
+    {
+        float vin = 0;
+        printf("Enter voltage: ");
+        int ret = scanf(" %f", &vin);
+        if (ret == EOF)
+        {
+            break;
+        }
+        if (vin < -13.95f || vin > -1.2f)
+            continue;
+        cmd[0] = 0x1;
+        cmd[1] = (uint8_t)((vin + 1.2) / -0.05);
+        printf("Voltage: %f V, Command: 0x%x\n", vin, cmd[1]);
+        fflush(stdout);
+        while((i2cbus_write(dev, &cmd, sizeof(cmd)) < 0) && (!done))
+            usleep(100000);
+    }
+cleanup:
+    i2cbus_close(dev);
     return 0;
 }
